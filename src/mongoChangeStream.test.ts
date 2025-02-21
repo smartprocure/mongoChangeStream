@@ -11,10 +11,16 @@ import {
 import ms from 'ms'
 import assert from 'node:assert'
 import { setTimeout } from 'node:timers/promises'
-import type { LastFlush, QueueOptions, QueueStats } from 'prom-utils'
+import {
+  type LastFlush,
+  type QueueOptions,
+  type QueueStats,
+  TimeoutError,
+  waitUntil,
+} from 'prom-utils'
 import { describe, test } from 'vitest'
 
-import { initSync } from './mongoChangeStream.js'
+import { getKeys, initSync } from './mongoChangeStream.js'
 import type {
   CursorErrorEvent,
   ScanOptions,
@@ -40,6 +46,44 @@ const getSync = async (options?: SyncOptions) => {
   const sync = initSync(redis, coll, options)
   sync.emitter.on('stateChange', console.log)
   return sync
+}
+
+interface AssertEventuallyOptions {
+  /** The maximum time to wait for the predicate to return true. */
+  timeout?: number
+  /** The time to wait between checks. */
+  interval?: number
+  /** The message to use if the assertion fails after the timeout. */
+  message?: string
+}
+
+/**
+ * Asserts that the provided predicate eventually returns true.
+ *
+ * @param pred - The predicate to check: an async function returning a boolean.
+ * @param options - @see AssertEventuallyOptions
+ *
+ * @throws AssertionError if the predicate does not return true before the
+ * timeout.
+ */
+const assertEventually = async (
+  pred: () => Promise<boolean>,
+  options: AssertEventuallyOptions = {}
+) => {
+  const { timeout, interval, message } = options
+
+  try {
+    await waitUntil(pred, {
+      timeout: timeout ?? ms('20s'),
+      checkFrequency: interval ?? ms('50ms'),
+    })
+  } catch (e) {
+    if (e instanceof TimeoutError) {
+      assert.fail(message)
+    } else {
+      throw e
+    }
+  }
 }
 
 describe.sequential('syncing', () => {
@@ -1207,5 +1251,62 @@ describe.sequential('syncing', () => {
     })
     sync.emitter.emit('foo', 'bar')
     assert.strictEqual(emitted, 'bar')
+  })
+
+  test('should update the resume token, even if there were no records updated', async () => {
+    const { coll, db, redis } = await getConns()
+    const sync = await getSync()
+    await initState(sync, db, coll)
+    const processRecords = async () => {
+      await setTimeout(5)
+    }
+
+    // Utilities for comparing resume tokens to see if they change over time.
+    const { changeStreamTokenKey } = getKeys(coll, {})
+    const getCurrentToken = async () => await redis.get(changeStreamTokenKey)
+    const assertResumeTokenUpdated = async (
+      lastToken: string | null,
+      when: string
+    ): Promise<string | null> => {
+      let currentToken: string | null = null
+
+      await assertEventually(
+        async () => {
+          currentToken = await getCurrentToken()
+          return currentToken !== lastToken
+        },
+        { message: `Resume token was not updated ${when}` }
+      )
+
+      return currentToken
+    }
+
+    // The resume token should initially be null, since we ran `initState`
+    // above.
+    let token = await getCurrentToken()
+    assert.equal(token, null)
+
+    const changeStream = await sync.processChangeStream(processRecords, {
+      timeout: ms('5s'),
+    })
+    changeStream.start()
+    // Let change stream connect
+    await setTimeout(ms('1s'))
+
+    // Waiting for a while should result in an updated resume token.
+    token = await assertResumeTokenUpdated(token, 'after waiting')
+
+    // Updating records results in an updated resume token.
+    await coll.updateMany({}, { $set: { createdAt: new Date('2022-01-03') } })
+    token = await assertResumeTokenUpdated(token, 'after updating records')
+
+    // Waiting for a while after an update should result in the resume token
+    // updating again.
+    token = await assertResumeTokenUpdated(
+      token,
+      'after waiting again after an update'
+    )
+
+    await changeStream.stop()
   })
 })
