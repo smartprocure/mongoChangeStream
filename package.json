@@ -13,7 +13,7 @@
   "scripts": {
     "prepare": "npm run lint && npm run test && npm run build",
     "clean": "rm -rf dist",
-    "build": "npm run fmt && npm run clean && tsc --declaration --project ./tsconfig-prod.json",
+    "build": "npm run fmt && npm run clean && tsc --declaration",
     "build:watch": "tsc --watch",
     "lint": "eslint src/**",
     "fmt": "prettier --ignore-path .gitignore --write './'",

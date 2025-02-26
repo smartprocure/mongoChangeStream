@@ -12,6 +12,15 @@ export const safelyCheckNext = (cursor: Cursor) => {
   debug('safelyCheckNext called')
   let lastError: unknown
 
+  // Returns the next record, or null if there are no more records.
+  //
+  // NOTE: In the event that there are no more records, this will still block
+  // for a minute or so, until there is a "no-op" event in the oplog. At that
+  // point, it will return null and a fresh resume token can be retrieved from
+  // the change stream object.
+  //
+  // Also returns null if there was an error, so it's important to check if
+  // there was an error afterwards via `errorExists()` and/or `getLastError()`.
   const getNext = async () => {
     debug('getNext called')
     try {
@@ -23,22 +32,8 @@ export const safelyCheckNext = (cursor: Cursor) => {
     }
   }
 
-  const hasNext = async () => {
-    debug('hasNext called')
-    try {
-      return await cursor.hasNext()
-    } catch (e) {
-      debug('hasNext error: %o', e)
-      if (cursor.closed) {
-        debug('hasNext cursor closed')
-      }
-      lastError = e
-      return false
-    }
-  }
-
   const errorExists = () => Boolean(lastError)
   const getLastError = () => lastError
 
-  return { hasNext, getNext, errorExists, getLastError }
+  return { getNext, errorExists, getLastError }
 }

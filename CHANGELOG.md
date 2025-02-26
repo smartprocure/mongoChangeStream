@@ -1,3 +1,16 @@
+# 0.59.0
+
+- The resume token stored in Redis is now updated regularly, even if the
+  collection has not been updated in a long time. This enables mongochangestream
+  to work in cases where older entries in the oplog (including the previously
+  stored, old resume token) have been truncated, and generally improves
+  performance because there are less oplog records to scan through.
+
+- Removed `hasNext`. It turns out that it blocks forever once you reach the end
+  of the change stream. It's better to use `getNext` and check whether the
+  result is null. When the end of the change stream is reached, `getNext` will
+  block for a minute or so and then return null.
+
 # 0.58.0
 
 - Wrap retry in try/catch and emit `processError` on exception.

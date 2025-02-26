@@ -401,6 +401,7 @@ export function initSync<ExtendedEvents extends EventEmitter.ValidEventTypes>(
       debug('Change stream pipeline %O', pipeline)
       // Lookup change stream token
       const token = await redis.get(keys.changeStreamTokenKey)
+      debug('Last recorded resume token: %O', token)
       const changeStreamOptions: mongodb.ChangeStreamOptions = token
         ? // Resume token found, so set change stream resume point
           { ...defaultOptions, resumeAfter: JSON.parse(token) }
@@ -422,27 +423,41 @@ export function initSync<ExtendedEvents extends EventEmitter.ValidEventTypes>(
       }
       state.change('starting')
 
-      const _processRecords = async (records: ChangeStreamDocument[]) => {
-        const numRecords = records.length
-        const token = records[numRecords - 1]._id
+      changeStream = await getChangeStream()
+      debug('Started change stream')
+
+      const _processRecords = async (
+        maybeRecords: (ChangeStreamDocument | null)[]
+      ) => {
+        // Each item in `maybeRecords` is either an actual record, or null. Null
+        // is a signal that we have reached the end of the change stream and we
+        // just need to update the resume token in Redis.
+        const records: ChangeStreamDocument[] = []
+        for (const record of maybeRecords) {
+          if (record) {
+            records.push(record)
+          }
+        }
         // Process batch of records with retries.
         // NOTE: processRecords could mutate records.
         try {
-          await retry(() => processRecords(records), {
-            ...retryOptions,
-            signal: retryController.signal,
-          })
-          debug('Processed %d records', numRecords)
-          debug('Token %s', token)
-          if (token) {
-            // Persist state
-            await redis.mset(
-              keys.changeStreamTokenKey,
-              JSON.stringify(token),
-              keys.lastChangeProcessedAtKey,
-              new Date().getTime()
-            )
+          if (records.length > 0) {
+            await retry(() => processRecords(records), {
+              ...retryOptions,
+              signal: retryController.signal,
+            })
+            debug('Processed %d records', records.length)
           }
+
+          // Persist state
+          const token = changeStream.resumeToken
+          debug('Updating resume token to: %s', token)
+          await redis.mset(
+            keys.changeStreamTokenKey,
+            JSON.stringify(token),
+            keys.lastChangeProcessedAtKey,
+            new Date().getTime()
+          )
         } catch (error) {
           debug('Process error %o', error)
           if (!state.is('stopping')) {
@@ -463,37 +478,53 @@ export function initSync<ExtendedEvents extends EventEmitter.ValidEventTypes>(
         timeout: ms('30s'),
         ...options,
       })
-      // Start the change stream
-      changeStream = await getChangeStream()
+
       const nextChecker = safelyCheckNext(changeStream)
       state.change('started')
-      let event: ChangeStreamDocument | null
-      // Consume change stream
-      while (await nextChecker.hasNext()) {
-        event = await changeStream.next()
-        debug('Change stream event %O', event)
-        // Omit nested fields that are not handled by $unset.
-        // For example, if 'a' was omitted then 'a.b.c' should be omitted.
-        if (
-          omit &&
-          event.operationType === 'update' &&
-          // Downstream libraries might unset event.updateDescription
-          // to optimize performance (e.g., mongo2elastic).
-          event.updateDescription
-        ) {
-          omitFieldsForUpdate(omit, event)
+
+      // Consume change stream until there is an error or `stop` is called.
+      while (!state.is('stopping', 'stopped')) {
+        // This always updates `changeStream.resumeToken`, even when we reach
+        // the end of the change stream and null is returned.
+        //
+        // This is important because we always want to keep a recent resume
+        // token. Attempting to resume from an older resume token might not
+        // work, because only a certain (configurable) amount of oplog history
+        // is kept. Even if the oplog entry still exists, it can take a very
+        // long time to scan through all of the oplog entries since then, so
+        // keeping a recent resume token is vital for performance.
+        const event: ChangeStreamDocument | null = await nextChecker.getNext()
+
+        if (event) {
+          debug('Change stream event %O', event)
+          // Omit nested fields that are not handled by $unset.
+          // For example, if 'a' was omitted then 'a.b.c' should be omitted.
+          if (
+            omit &&
+            event.operationType === 'update' &&
+            // Downstream libraries might unset event.updateDescription
+            // to optimize performance (e.g., mongo2elastic).
+            event.updateDescription
+          ) {
+            omitFieldsForUpdate(omit, event)
+          }
         }
+
         await queue.enqueue(event)
         await pause.maybeBlock()
+
+        if (nextChecker.errorExists() && !state.is('stopping')) {
+          emit('cursorError', {
+            name: 'processChangeStream',
+            error: nextChecker.getLastError(),
+          } as CursorErrorEvent)
+          break
+        }
       }
+
       await queue.flush()
-      // An error occurred getting next and we are not stopping
-      if (nextChecker.errorExists() && !state.is('stopping')) {
-        emit('cursorError', {
-          name: 'processChangeStream',
-          error: nextChecker.getLastError(),
-        } as CursorErrorEvent)
-      }
+
+      // Signal stopping => stopped state change
       deferred.done()
       debug('Exit change stream')
     }
